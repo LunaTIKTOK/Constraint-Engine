@@ -81,6 +81,22 @@ if __name__ == "__main__":
             ],
             "verdict": "UNVERIFIED",
         },
+        {
+            "claim": "Waymo is already safer than human drivers in deployed urban environments",
+            "sources": [
+                "Waymo safety reports or official data on autonomous driving performance",
+                "Third party studies comparing autonomous vehichle safety to human drivers",
+            ],
+            "facts": [
+                "Waymo reports lower accident rates per mile compared to human drivers in some deployments",
+                "Autonomous vehichles operate without fatigue or human error factors",
+            ],
+            "gaps": [
+                "Waymo data may be limited to specific cities and conditions",
+                "Safety comparisons may vary depending on metrics and reporting methods",
+            ],
+            "verdict": "partially verified",
+        }
     ]
 
     for c in claims:
