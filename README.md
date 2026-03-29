@@ -10,4 +10,4 @@ Its purpose is simple:
 - reduce decision error
 - reduce wasted compute
 - block structurally invalid or high-risk actions
-- escalate uncertain actions to a human when needed
+- escalate structurally invalid or high-risk actions to a human when needed
