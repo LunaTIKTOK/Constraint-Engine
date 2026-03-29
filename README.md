@@ -2,12 +2,50 @@
 
 Claim-Verify is a pre-execution risk engine for humans and AI agents.
 
-It takes any claim, task, or proposed action, estimates its reliability and the likely cost of being wrong, and decides whether execution should proceed, proceed with warning, or require human approval.
+It evaluates claims, tasks, or proposed actions before execution by estimating:
 
-This is not a fact-checker and not a generic safety wrapper. Claim-Verify is a control layer that prices uncertainty before action.
+- structural validity
+- evidentiary support
+- decision risk
+- expected cost of error
+- token / compute waste risk
 
-Its purpose is simple:
-- reduce decision error
-- reduce wasted compute
-- block structurally invalid or high-risk actions
-- escalate structurally invalid or high-risk actions to a human when needed
+It then assigns an execution permission:
+
+- allow
+- allow_with_warning
+- block
+
+## Purpose
+
+Claim-Verify reduces decision error and prevents execution on unsupported or invalid claims.
+
+It does not determine absolute truth.  
+It determines whether acting is justified.
+
+## Usage
+
+Run with JSON input:
+
+python verify.py --input claims.json
+
+Run with raw text:
+
+python verify.py --text_input "your input here"
+
+Run JSON output:
+
+python verify.py --input claims.json --json
+
+## Output
+
+Each result includes:
+
+- structural_validity
+- truth_status
+- evidence_strength
+- decision_risk
+- expected_error_cost
+- token_waste_risk
+- execution_permission
+- enforcement_reason
