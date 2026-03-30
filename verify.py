@@ -37,6 +37,9 @@ ALLOWED_ACTION_STATUS = {
     "monitor_only",
     "do_not_act",
 }
+ALLOWED_RISK_PROFILES = {"strict", "balanced", "speculative"}
+ALLOWED_ACTION_TYPES = {"reversible", "costly", "external_facing", "irreversible"}
+ALLOWED_TOXICITY_RISK = {"low", "medium", "high", "critical"}
 
 FORWARD_LOOKING_TERMS = (" will ", " going to ", " expected ", " likely ")
 OPINION_TERMS = (" should ", " best ", " worst ", " better ")
@@ -94,6 +97,15 @@ class ClaimReport:
     analysis_claim: str = ""
     language_detected: str = "english"
     translation_used: bool = False
+    risk_profile: str = "balanced"
+    action_type: str = "reversible"
+    base_tokens: int = 4000
+    model_price: float = 0.000003
+    toxicity_risk: str = "medium"
+    reasoning_contamination_risk: str = "medium"
+    expected_benefit: float = 0.0
+    benefit_confidence: float = 0.0
+    opportunity_cost_of_inaction: float = 0.0
     claim_type: str = "interpretive"
     truth_status: str = "unknown"
     evidence_strength: str = "none"
@@ -111,14 +123,62 @@ class ClaimReport:
     def from_dict(cls, data: dict[str, Any]) -> "ClaimReport":
         """Build a normalized + inferred ClaimReport from dictionary data."""
         claim = clean_text(data.get("claim"), fallback="No claim provided")
+        short_circuit = structural_short_circuit(claim)
         language_data = normalize_claim_language(claim)
         original_claim = language_data["original_claim"]
         analysis_claim = language_data["analysis_claim"]
         language_detected = language_data["language_detected"]
         translation_used = bool(language_data["translation_used"])
+        risk_profile = normalize_risk_profile(data.get("risk_profile"))
+        action_type = normalize_action_type(data.get("action_type"))
+        base_tokens = int(data.get("base_tokens", 4000))
+        model_price = float(data.get("model_price", 0.000003))
         sources = clean_list(data.get("sources"))
         facts = clean_list(data.get("facts"))
         gaps = clean_list(data.get("gaps"))
+        toxicity_risk = (
+            normalize_toxicity_risk(data.get("toxicity_risk"))
+            if has_user_value(data.get("toxicity_risk"))
+            else infer_toxicity_risk(analysis_claim, gaps, action_type)
+        )
+        reasoning_contamination_risk = (
+            normalize_toxicity_risk(data.get("reasoning_contamination_risk"))
+            if has_user_value(data.get("reasoning_contamination_risk"))
+            else infer_reasoning_contamination_risk(analysis_claim, gaps, toxicity_risk)
+        )
+        expected_benefit = float(data.get("expected_benefit", 0.0))
+        benefit_confidence = float(data.get("benefit_confidence", 0.0))
+        opportunity_cost_of_inaction = float(data.get("opportunity_cost_of_inaction", 0.0))
+
+        if short_circuit is not None:
+            return cls(
+                claim=original_claim,
+                original_claim=original_claim,
+                analysis_claim=analysis_claim,
+                language_detected=language_detected,
+                translation_used=translation_used,
+                risk_profile=risk_profile,
+                action_type=action_type,
+                base_tokens=base_tokens,
+                model_price=model_price,
+                toxicity_risk=toxicity_risk,
+                reasoning_contamination_risk=reasoning_contamination_risk,
+                expected_benefit=expected_benefit,
+                benefit_confidence=benefit_confidence,
+                opportunity_cost_of_inaction=opportunity_cost_of_inaction,
+                claim_type=short_circuit["claim_type"],
+                truth_status=short_circuit["truth_status"],
+                evidence_strength=short_circuit["evidence_strength"],
+                bullshit_risk=short_circuit["bullshit_risk"],
+                action_status=short_circuit["action_status"],
+                rewrite_required=short_circuit["rewrite_required"],
+                sources=sources,
+                facts=facts,
+                gaps=gaps,
+                interpretation=clean_text(data.get("interpretation"), fallback=""),
+                bottom_line=clean_text(data.get("bottom_line"), fallback=""),
+                next_step=clean_text(data.get("next_step"), fallback=""),
+            )
 
         verdict = clean_text(data.get("verdict"), fallback="")
 
@@ -159,6 +219,15 @@ class ClaimReport:
             analysis_claim=analysis_claim,
             language_detected=language_detected,
             translation_used=translation_used,
+            risk_profile=risk_profile,
+            action_type=action_type,
+            base_tokens=base_tokens,
+            model_price=model_price,
+            toxicity_risk=toxicity_risk,
+            reasoning_contamination_risk=reasoning_contamination_risk,
+            expected_benefit=expected_benefit,
+            benefit_confidence=benefit_confidence,
+            opportunity_cost_of_inaction=opportunity_cost_of_inaction,
             claim_type=claim_type,
             truth_status=truth_status,
             evidence_strength=evidence_strength,
@@ -176,6 +245,7 @@ class ClaimReport:
     def to_dict(self) -> dict[str, Any]:
         """Return structured agent-ready JSON output."""
         structural_validity = infer_structural_validity(self.analysis_claim)
+        risk_profile = normalize_risk_profile(self.risk_profile)
 
         truth_status = self.truth_status
         if truth_status == "unknown" and contradicts_known_constraints(self.analysis_claim):
@@ -207,6 +277,8 @@ class ClaimReport:
             evidence_strength=self.evidence_strength,
             bullshit_risk=bullshit_risk,
             decision_risk=decision_risk,
+            risk_profile=risk_profile,
+            structural_validity=structural_validity,
         )
         token_waste_risk = infer_token_waste_risk(
             evidence_strength=self.evidence_strength,
@@ -223,6 +295,8 @@ class ClaimReport:
         execution_permission = infer_execution_permission(
             report=self,
             decision_risk=decision_risk,
+            risk_profile=risk_profile,
+            structural_validity=structural_validity,
         )
         enforcement_reason = infer_enforcement_reason(
             report=self,
@@ -230,6 +304,8 @@ class ClaimReport:
             expected_error_cost=expected_error_cost,
             confidence=confidence,
             execution_permission=execution_permission,
+            risk_profile=risk_profile,
+            structural_validity=structural_validity,
         )
 
         if structural_validity == "invalid":
@@ -254,6 +330,88 @@ class ClaimReport:
             execution_permission=execution_permission,
             structural_validity=structural_validity,
             bullshit_risk=bullshit_risk,
+            risk_profile=risk_profile,
+        )
+        cost_estimate = compute_action_cost_estimate(
+            base_tokens=max(1, int(self.base_tokens)),
+            compute_multiplier=bypass_simulation["compute_multiplier"],
+            confidence=confidence,
+            bullshit_risk=bullshit_risk,
+            structural_validity=structural_validity,
+            model_price_per_token=max(0.0, float(self.model_price)),
+        )
+        expected_benefit = max(0.0, float(self.expected_benefit))
+        benefit_confidence = max(0.0, min(1.0, float(self.benefit_confidence)))
+        opportunity_cost_of_inaction = max(0.0, float(self.opportunity_cost_of_inaction))
+        expected_value = compute_expected_value(
+            expected_benefit=expected_benefit,
+            benefit_confidence=benefit_confidence,
+            total_expected_cost_usd=cost_estimate.total_expected_cost_usd,
+        )
+
+        if structural_validity == "invalid":
+            execution_permission = "block"
+        elif risk_profile == "strict":
+            if truth_status == "unsupported" and self.action_type in {"costly", "external_facing", "irreversible"}:
+                execution_permission = "block"
+            elif (
+                truth_status in {"unknown", "unsupported"}
+                and (
+                    bullshit_risk in {"high", "very_high"}
+                    or self.toxicity_risk in {"high", "critical"}
+                )
+            ):
+                execution_permission = "block"
+            elif truth_status == "unsupported":
+                execution_permission = "allow_with_warning"
+        elif risk_profile == "balanced":
+            if truth_status == "unsupported" and self.action_type == "irreversible":
+                execution_permission = "block"
+            elif truth_status == "unsupported":
+                execution_permission = "allow_with_warning"
+            if self.toxicity_risk == "critical":
+                execution_permission = "block"
+        elif risk_profile == "speculative":
+            if truth_status == "unsupported" and structural_validity == "valid":
+                execution_permission = "allow_with_warning"
+            if self.action_type == "irreversible" and structural_validity != "valid":
+                execution_permission = "block"
+
+        if (
+            risk_profile == "speculative"
+            and structural_validity == "valid"
+            and self.action_type == "reversible"
+            and expected_value > 0
+            and execution_permission == "block"
+        ):
+            execution_permission = "allow_with_warning"
+            enforcement_reason = "speculative upside override with positive expected value"
+            bypass_simulation = simulate_bypass(
+                self,
+                execution_permission=execution_permission,
+                structural_validity=structural_validity,
+                bullshit_risk=bullshit_risk,
+                risk_profile=risk_profile,
+            )
+            cost_estimate = compute_action_cost_estimate(
+                base_tokens=max(1, int(self.base_tokens)),
+                compute_multiplier=bypass_simulation["compute_multiplier"],
+                confidence=confidence,
+                bullshit_risk=bullshit_risk,
+                structural_validity=structural_validity,
+                model_price_per_token=max(0.0, float(self.model_price)),
+            )
+            expected_value = compute_expected_value(
+                expected_benefit=expected_benefit,
+                benefit_confidence=benefit_confidence,
+                total_expected_cost_usd=cost_estimate.total_expected_cost_usd,
+            )
+
+        action_recommendation = infer_action_recommendation(
+            execution_permission=execution_permission,
+            expected_value=expected_value,
+            expected_benefit=expected_benefit,
+            risk_profile=risk_profile,
         )
 
         reason = self.bottom_line or self.interpretation or build_reason(
@@ -269,6 +427,8 @@ class ClaimReport:
             "analysis_claim": self.analysis_claim,
             "language_detected": self.language_detected,
             "translation_used": self.translation_used,
+            "risk_profile": risk_profile,
+            "action_type": self.action_type,
             "claim_type": self.claim_type,
             "structural_validity": structural_validity,
             "truth_status": truth_status,
@@ -286,6 +446,14 @@ class ClaimReport:
             "failure_mode": failure_mode,
             "execution_permission": execution_permission,
             "enforcement_reason": enforcement_reason,
+            "cost_estimate": cost_estimate.to_dict(),
+            "toxicity_risk": self.toxicity_risk,
+            "reasoning_contamination_risk": self.reasoning_contamination_risk,
+            "expected_benefit": round(expected_benefit, 6),
+            "benefit_confidence": round(benefit_confidence, 6),
+            "expected_value": round(expected_value, 6),
+            "opportunity_cost_of_inaction": round(opportunity_cost_of_inaction, 6),
+            "action_recommendation": action_recommendation,
             "bypass_simulation": bypass_simulation,
             "reason": reason,
             "next_step": self.next_step or PLACEHOLDER_TEXT,
@@ -300,11 +468,15 @@ class ClaimReport:
         print_section("ANALYSIS CLAIM", text=self.analysis_claim)
         print_section("LANGUAGE DETECTED", text=self.language_detected)
         print_section("TRANSLATION USED", text=format_bool(self.translation_used))
+        print_section("RISK PROFILE", text=payload["risk_profile"])
+        print_section("ACTION TYPE", text=payload["action_type"])
         print_section("CLAIM TYPE", text=self.claim_type)
         print_section("STRUCTURAL VALIDITY", text=payload["structural_validity"])
         print_section("TRUTH STATUS", text=payload["truth_status"])
         print_section("EVIDENCE STRENGTH", text=self.evidence_strength)
         print_section("BULLSHIT RISK", text=payload["bullshit_risk"])
+        print_section("TOXICITY RISK", text=payload["toxicity_risk"])
+        print_section("REASONING CONTAMINATION RISK", text=payload["reasoning_contamination_risk"])
         print_section("ACTION STATUS", text=payload["action_status"])
         print_section("REWRITE REQUIRED", text=format_bool(self.rewrite_required))
         print_section("ATOMIC CLAIMS", items=payload["rewritten_claims"])
@@ -315,6 +487,25 @@ class ClaimReport:
         print_section("FAILURE MODE", text=payload["failure_mode"])
         print_section("EXECUTION PERMISSION", text=payload["execution_permission"])
         print_section("ENFORCEMENT REASON", text=payload["enforcement_reason"])
+        print_section("EXPECTED BENEFIT", text=str(payload["expected_benefit"]))
+        print_section("BENEFIT CONFIDENCE", text=str(payload["benefit_confidence"]))
+        print_section("EXPECTED VALUE", text=str(payload["expected_value"]))
+        print_section("OPPORTUNITY COST OF INACTION", text=str(payload["opportunity_cost_of_inaction"]))
+        print_section("ACTION RECOMMENDATION", text=payload["action_recommendation"])
+        print_section(
+            "COST ESTIMATE",
+            items=[
+                f"base_tokens: {payload['cost_estimate']['base_tokens']}",
+                f"compute_multiplier: {payload['cost_estimate']['compute_multiplier']}",
+                f"correction_probability: {payload['cost_estimate']['correction_probability']}",
+                f"expected_tokens: {payload['cost_estimate']['expected_tokens']}",
+                f"expected_cost_usd: {payload['cost_estimate']['expected_cost_usd']}",
+                f"correction_cost_usd: {payload['cost_estimate']['correction_cost_usd']}",
+                f"total_expected_cost_usd: {payload['cost_estimate']['total_expected_cost_usd']}",
+                f"risk_label: {payload['cost_estimate']['risk_label']}",
+                f"proceed_recommendation: {payload['cost_estimate']['proceed_recommendation']}",
+            ],
+        )
         print_section(
             "BYPASS SIMULATION",
             items=[
@@ -345,6 +536,94 @@ class ClaimReport:
             print_section("NEXT STEP", text=self.next_step)
 
         print_divider()
+
+
+@dataclass
+class ActionCostEstimate:
+    """Economic estimate for claim execution under a risk profile."""
+
+    base_tokens: int
+    compute_multiplier: float
+    correction_probability: float
+    expected_tokens: int
+    expected_cost_usd: float
+    correction_cost_usd: float
+    total_expected_cost_usd: float
+    risk_label: str
+    proceed_recommendation: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert estimate to JSON-ready dictionary."""
+        return {
+            "base_tokens": self.base_tokens,
+            "compute_multiplier": round(self.compute_multiplier, 3),
+            "correction_probability": round(self.correction_probability, 3),
+            "expected_tokens": self.expected_tokens,
+            "expected_cost_usd": round(self.expected_cost_usd, 6),
+            "correction_cost_usd": round(self.correction_cost_usd, 6),
+            "total_expected_cost_usd": round(self.total_expected_cost_usd, 6),
+            "risk_label": self.risk_label,
+            "proceed_recommendation": self.proceed_recommendation,
+        }
+
+
+def compute_expected_benefit_estimate(
+    *,
+    claim_type: str,
+    truth_status: str,
+    evidence_strength: str,
+    risk_profile: str,
+    analysis_claim: str,
+) -> tuple[float, float, float]:
+    """Estimate upside potential, confidence in benefit, and opportunity cost of inaction."""
+    base_benefit = {
+        "factual": 1.0,
+        "interpretive": 1.4,
+        "opinion": 1.1,
+        "forward_looking": 2.4,
+        "non_falsifiable": 0.8,
+    }.get(claim_type, 1.2)
+
+    truth_factor = {
+        "true": 1.2,
+        "mixed": 1.0,
+        "unknown": 0.9,
+        "unsupported": 0.75,
+        "false": 0.3,
+        "structurally_invalid": 0.0,
+    }.get(truth_status, 0.8)
+
+    evidence_factor = {"strong": 1.2, "moderate": 1.0, "weak": 0.75, "none": 0.6}.get(evidence_strength, 0.8)
+    profile_factor = {"strict": 0.85, "balanced": 1.0, "speculative": 1.35}.get(risk_profile, 1.0)
+
+    asymmetry_boost = 1.0
+    lowered = analysis_claim.lower()
+    if any(token in lowered for token in ("dominate", "breakthrough", "massive", "transform", "10x")):
+        asymmetry_boost = 1.5
+
+    expected_benefit = base_benefit * truth_factor * evidence_factor * profile_factor * asymmetry_boost
+    benefit_confidence = max(0.1, min(0.95, (truth_factor + evidence_factor) / 2.2))
+    opportunity_cost_of_inaction = expected_benefit * max(0.2, 1.1 - benefit_confidence)
+    return expected_benefit, benefit_confidence, opportunity_cost_of_inaction
+
+
+def infer_action_recommendation(
+    *,
+    execution_permission: str,
+    expected_value: float,
+    expected_benefit: float,
+    risk_profile: str,
+) -> str:
+    """Recommend whether to proceed/prioritize using both risk and upside."""
+    if execution_permission == "block":
+        if risk_profile == "speculative" and expected_value > 0:
+            return "allow_with_warning_high_upside"
+        return "do_not_act"
+    if expected_value <= 0 and expected_benefit < 1.0:
+        return "do_not_prioritize"
+    if expected_value > 0:
+        return "prioritize"
+    return "monitor_only"
 
 
 def has_user_value(value: Any) -> bool:
@@ -486,6 +765,39 @@ def normalize_action_status(value: Any) -> str:
     return normalized if normalized in ALLOWED_ACTION_STATUS else "monitor_only"
 
 
+def normalize_risk_profile(value: Any) -> str:
+    """Normalize risk profile into supported values."""
+    token = normalize_label(value)
+    alias_map = {
+        "conservative": "strict",
+        "default": "balanced",
+        "aggressive": "speculative",
+    }
+    normalized = alias_map.get(token, token)
+    return normalized if normalized in ALLOWED_RISK_PROFILES else "balanced"
+
+
+def normalize_action_type(value: Any) -> str:
+    """Normalize action type into supported values."""
+    token = normalize_label(value)
+    alias_map = {
+        "safe": "reversible",
+        "expensive": "costly",
+        "customer": "external_facing",
+        "destructive": "irreversible",
+    }
+    normalized = alias_map.get(token, token)
+    return normalized if normalized in ALLOWED_ACTION_TYPES else "reversible"
+
+
+def normalize_toxicity_risk(value: Any) -> str:
+    """Normalize toxicity/contamination risk level."""
+    token = normalize_label(value)
+    alias_map = {"very_high": "critical", "severe": "critical"}
+    normalized = alias_map.get(token, token)
+    return normalized if normalized in ALLOWED_TOXICITY_RISK else "medium"
+
+
 def normalize_rewrite_required(value: Any) -> bool:
     """Normalize rewrite_required into a boolean."""
     if isinstance(value, bool):
@@ -502,6 +814,105 @@ def normalize_rewrite_required(value: Any) -> bool:
             return False
 
     return False
+
+
+def structural_short_circuit(claim: str) -> dict[str, Any] | None:
+    """Short-circuit impossible structural claims before deeper inference."""
+    structural_validity = infer_structural_validity(claim)
+    if structural_validity != "invalid":
+        return None
+
+    return {
+        "claim_type": infer_claim_type(claim),
+        "truth_status": "structurally_invalid",
+        "evidence_strength": "none",
+        "bullshit_risk": "very_high",
+        "toxicity_risk": "critical",
+        "reasoning_contamination_risk": "critical",
+        "action_status": "do_not_act",
+        "rewrite_required": True,
+    }
+
+
+def infer_toxicity_risk(claim: str, gaps: list[str], action_type: str) -> str:
+    """Estimate risk that acting on this input causes harmful downstream effects."""
+    text = claim.lower()
+    score = 0
+    if any(token in text for token in ("delete", "erase", "drop", "guarantee", "always", "all")):
+        score += 2
+    if len(gaps) >= 2:
+        score += 1
+    if action_type in {"costly", "irreversible", "external_facing"}:
+        score += 1
+    if score >= 4:
+        return "critical"
+    if score >= 3:
+        return "high"
+    if score >= 1:
+        return "medium"
+    return "low"
+
+
+def infer_reasoning_contamination_risk(claim: str, gaps: list[str], toxicity_risk: str) -> str:
+    """Estimate likelihood of bad assumptions propagating into tool calls/loops."""
+    text = claim.lower()
+    score = 0
+    if any(token in text for token in ("obvious", "guaranteed", "must", "definitely", "never")):
+        score += 2
+    if infer_rewrite_required(claim):
+        score += 1
+    if len(gaps) > 0:
+        score += 1
+    if toxicity_risk in {"high", "critical"}:
+        score += 1
+    if score >= 4:
+        return "critical"
+    if score >= 3:
+        return "high"
+    if score >= 1:
+        return "medium"
+    return "low"
+
+
+def compute_expected_value(*, expected_benefit: float, benefit_confidence: float, total_expected_cost_usd: float) -> float:
+    """Compute expected value from upside and expected cost."""
+    return (expected_benefit * benefit_confidence) - total_expected_cost_usd
+
+
+def compute_action_cost_estimate(
+    *,
+    base_tokens: int,
+    compute_multiplier: float,
+    confidence: float,
+    bullshit_risk: str,
+    structural_validity: str,
+    model_price_per_token: float,
+) -> ActionCostEstimate:
+    """Estimate expected action cost and correction burden."""
+    confidence_penalty = max(0.1, 1.0 - confidence)
+    risk_factor = {"low": 0.15, "medium": 0.35, "high": 0.65, "very_high": 0.8}.get(bullshit_risk, 0.35)
+    correction_probability = min(0.95, max(0.05, (risk_factor + confidence_penalty) / 1.5))
+    if structural_validity == "invalid":
+        correction_probability = max(correction_probability, 0.9)
+
+    expected_tokens = int(round(base_tokens * max(1.0, compute_multiplier)))
+    expected_cost_usd = expected_tokens * model_price_per_token
+    correction_cost_usd = expected_cost_usd * correction_probability * 1.5
+    total_expected_cost_usd = expected_cost_usd + correction_cost_usd
+    proceed_recommendation = "proceed_with_gate" if structural_validity == "valid" else "do_not_proceed"
+    risk_label = "high" if correction_probability >= 0.6 else "medium" if correction_probability >= 0.3 else "low"
+
+    return ActionCostEstimate(
+        base_tokens=base_tokens,
+        compute_multiplier=compute_multiplier,
+        correction_probability=correction_probability,
+        expected_tokens=expected_tokens,
+        expected_cost_usd=expected_cost_usd,
+        correction_cost_usd=correction_cost_usd,
+        total_expected_cost_usd=total_expected_cost_usd,
+        risk_label=risk_label,
+        proceed_recommendation=proceed_recommendation,
+    )
 
 
 def infer_claim_type(claim: str) -> str:
@@ -686,10 +1097,20 @@ def infer_expected_error_cost(
     evidence_strength: str,
     bullshit_risk: str,
     decision_risk: str,
+    risk_profile: str,
+    structural_validity: str,
 ) -> str:
     """Infer expected error cost as low/medium/high."""
+    if structural_validity == "invalid":
+        return "high"
+
+    if truth_status == "unsupported" and structural_validity == "valid":
+        if risk_profile == "speculative":
+            return "medium"
+        return "medium"
+
     if (
-        bullshit_risk in {"high", "very high"}
+        bullshit_risk in {"high", "very_high"}
         or truth_status in {"unknown", "structurally_invalid"}
         or decision_risk == "high"
     ):
@@ -821,6 +1242,8 @@ def should_block_action(report: ClaimReport) -> bool:
         evidence_strength=report.evidence_strength,
         bullshit_risk=report.bullshit_risk,
         decision_risk=decision_risk,
+        risk_profile=normalize_risk_profile(report.risk_profile),
+        structural_validity=infer_structural_validity(report.analysis_claim),
     )
     confidence = infer_confidence(
         evidence_strength=report.evidence_strength,
@@ -836,9 +1259,52 @@ def should_block_action(report: ClaimReport) -> bool:
     )
 
 
-def infer_execution_permission(report: ClaimReport, decision_risk: str) -> str:
+def infer_execution_permission(
+    report: ClaimReport,
+    decision_risk: str,
+    risk_profile: str,
+    structural_validity: str,
+) -> str:
     """Infer execution permission level for pre-action gate."""
-    if should_block_action(report):
+    if structural_validity == "invalid":
+        return "block"
+
+    if risk_profile == "strict":
+        if report.truth_status == "unsupported":
+            if report.action_type in {"costly", "external_facing", "irreversible"}:
+                return "block"
+            if (
+                report.bullshit_risk in {"high", "very_high"}
+                or report.toxicity_risk in {"high", "critical"}
+                or report.reasoning_contamination_risk in {"high", "critical"}
+            ):
+                return "block"
+            return "allow_with_warning"
+        if (
+            report.truth_status in {"unknown", "unsupported"}
+            and (
+                report.bullshit_risk in {"high", "very_high"}
+                or report.toxicity_risk in {"high", "critical"}
+                or report.reasoning_contamination_risk in {"high", "critical"}
+            )
+        ):
+            return "block"
+    elif risk_profile == "balanced":
+        if report.truth_status == "unsupported":
+            if report.action_type == "irreversible":
+                return "block"
+            return "allow_with_warning"
+        if report.toxicity_risk == "critical":
+            return "block"
+        if decision_risk == "medium":
+            return "allow_with_warning"
+    elif risk_profile == "speculative":
+        if report.action_type == "irreversible" and report.truth_status in {"unknown", "unsupported", "false"}:
+            return "block"
+        if report.truth_status == "unsupported":
+            return "allow_with_warning"
+
+    if risk_profile != "speculative" and should_block_action(report):
         return "block"
 
     if report.action_status == "safe_to_act":
@@ -856,8 +1322,17 @@ def infer_enforcement_reason(
     expected_error_cost: str,
     confidence: float,
     execution_permission: str,
+    risk_profile: str,
+    structural_validity: str,
 ) -> str:
     """Infer concise reason for enforcement decision."""
+    if structural_validity == "invalid":
+        return "structural invalidity gate"
+    if report.truth_status == "unsupported":
+        if risk_profile == "strict":
+            return "unsupported claim requires warning/approval in strict profile"
+        return "unsupported claim allowed only with warning"
+
     if execution_permission == "block":
         if report.action_status == "do_not_act":
             return "explicit do_not_act gate"
@@ -882,6 +1357,7 @@ def simulate_bypass(
     execution_permission: str | None = None,
     structural_validity: str | None = None,
     bullshit_risk: str | None = None,
+    risk_profile: str = "balanced",
 ) -> dict[str, Any]:
     """Simulate likely consequence of bypassing the pre-action gate."""
     decision_risk = infer_decision_risk(
@@ -889,8 +1365,8 @@ def simulate_bypass(
         evidence_strength=report.evidence_strength,
         bullshit_risk=report.bullshit_risk,
     )
-    permission = execution_permission or infer_execution_permission(report, decision_risk)
     validity = structural_validity or infer_structural_validity(report.analysis_claim)
+    permission = execution_permission or infer_execution_permission(report, decision_risk, risk_profile, validity)
     risk = bullshit_risk or report.bullshit_risk
 
     if permission == "block":
@@ -1107,62 +1583,69 @@ def get_sample_claims() -> list[ClaimReport]:
     """Return built-in realistic sample claim reports with varied risk levels."""
     sample_data = [
         {
-            "claim": "AI copilots will replace all engineers and guaranteed huge productivity gains because they never make mistakes.",
-            "sources": ["Mixed benchmark reports across teams"],
-            "facts": ["Productivity gains vary by task and require review."],
-            "gaps": [
-                "Contains absolute words and broad universal claims.",
-                "Multiple causal assertions are bundled into one statement.",
-            ],
+            "claim": "A new tokenization approach could significantly reduce inference cost in volatile market-monitoring agents.",
+            "action_type": "costly",
+            "risk_profile": "speculative",
+            "sources": ["Internal pilot notes"],
+            "facts": ["Pilot showed reduced token usage on one benchmark."],
+            "gaps": ["No production validation yet."],
             "truth_status": "unknown",
-            "next_step": "Split into measurable subclaims and validate each with controlled benchmarks.",
+            "expected_benefit": 3.0,
+            "benefit_confidence": 0.45,
+            "opportunity_cost_of_inaction": 1.2,
+            "next_step": "Run controlled canary before scaling.",
         },
         {
-            "claim": "Switching incident postmortems to blameless templates reduced repeat Sev-1 incidents by 28 percent last quarter.",
-            "sources": [
-                "Internal incident tracker export",
-                "Quarterly reliability review",
-                "Postmortem process changelog",
-            ],
-            "facts": [
-                "Repeat Sev-1 count dropped from 18 to 13.",
-                "Template adoption reached 95 percent of incidents.",
-                "No simultaneous major process change was recorded.",
-            ],
-            "gaps": [],
-            "truth_status": "true",
-            "evidence_strength": "strong",
-            "next_step": "Replicate this process in adjacent teams and monitor quarterly.",
-        },
-        {
-            "claim": "The new model is better and cheaper, because it uses fewer GPUs, and inference latency is lower in production.",
-            "sources": [
-                "Internal benchmark dashboard",
-                "Cloud cost report",
-            ],
-            "facts": [
-                "Observed lower p95 latency on matched workloads.",
-                "Observed lower monthly GPU spend in staging and production.",
-            ],
-            "gaps": ["Need independent replication on broader workload mix."],
+            "claim": "Send apology email to the affected enterprise customer and include a temporary remediation timeline.",
+            "action_type": "external_facing",
+            "risk_profile": "balanced",
+            "sources": ["Support incident summary"],
+            "facts": ["Outage lasted 42 minutes and customer escalation is open."],
+            "gaps": ["Legal wording not yet approved."],
             "truth_status": "mixed",
-            "next_step": "Validate each decomposed subclaim separately over the next release cycle.",
+            "expected_benefit": 1.4,
+            "benefit_confidence": 0.65,
+            "opportunity_cost_of_inaction": 0.9,
+            "next_step": "Require legal/comms signoff before send.",
         },
         {
-            "claim": "Coinbase dominará los pagos de agentes y USDC se convertirá en la capa principal de liquidación para agentes de IA",
-            "sources": [],
+            "claim": "Delete the legacy finance exports directory immediately to prevent duplicate reconciliation runs.",
+            "action_type": "irreversible",
+            "risk_profile": "strict",
+            "sources": ["Operator request in chat"],
             "facts": [],
-            "gaps": [],
+            "gaps": ["No backup confirmation provided."],
             "truth_status": "unknown",
-            "next_step": "Translate and validate each subclaim with independent adoption metrics.",
+            "expected_benefit": 0.7,
+            "benefit_confidence": 0.3,
+            "opportunity_cost_of_inaction": 0.2,
+            "next_step": "Block and require backup + approval ticket.",
         },
         {
-            "claim": "Coinbase dominera les paiements d'agents et USDC deviendra la principale couche de règlement pour les agents IA",
+            "claim": "Call several APIs and optimize latency quickly; pick whichever endpoint seems fastest.",
+            "action_type": "reversible",
+            "risk_profile": "balanced",
             "sources": [],
             "facts": [],
-            "gaps": [],
+            "gaps": ["No endpoint list, SLA target, or rollback criteria."],
             "truth_status": "unknown",
-            "next_step": "Translate and validate each subclaim with audited market-share and settlement-volume data.",
+            "expected_benefit": 0.9,
+            "benefit_confidence": 0.35,
+            "opportunity_cost_of_inaction": 0.4,
+            "next_step": "Decompose into explicit API calls, metrics, and stop conditions.",
+        },
+        {
+            "claim": "A single AI firewall update will eliminate all cybersecurity breaches forever across every system.",
+            "action_type": "external_facing",
+            "risk_profile": "speculative",
+            "sources": ["Vendor claim deck"],
+            "facts": ["No universal guarantee has been demonstrated."],
+            "gaps": ["Absolute impossible guarantee and no independent validation."],
+            "truth_status": "unknown",
+            "expected_benefit": 2.5,
+            "benefit_confidence": 0.25,
+            "opportunity_cost_of_inaction": 1.0,
+            "next_step": "Short-circuit as structurally invalid and block execution.",
         },
     ]
     return [ClaimReport.from_dict(item) for item in sample_data]
@@ -1186,6 +1669,32 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Raw text input to auto-extract claim candidates and evaluate them.",
     )
+    parser.add_argument(
+        "--base-tokens",
+        type=int,
+        default=4000,
+        help="Base token budget used for cost estimation (default: 4000).",
+    )
+    parser.add_argument(
+        "--model-price",
+        type=float,
+        default=0.000003,
+        help="USD price per token for cost estimation (default: 0.000003).",
+    )
+    parser.add_argument(
+        "--risk-profile",
+        type=str,
+        default="balanced",
+        choices=sorted(ALLOWED_RISK_PROFILES),
+        help="Risk profile for execution gating and cost posture.",
+    )
+    parser.add_argument(
+        "--action-type",
+        type=str,
+        default="reversible",
+        choices=sorted(ALLOWED_ACTION_TYPES),
+        help="Action type describing reversibility and externality of execution.",
+    )
     return parser.parse_args()
 
 
@@ -1193,13 +1702,42 @@ def main() -> int:
     """Entry point for the CLI."""
     args = parse_args()
 
+    default_options = {
+        "risk_profile": normalize_risk_profile(args.risk_profile),
+        "action_type": normalize_action_type(args.action_type),
+        "base_tokens": args.base_tokens,
+        "model_price": args.model_price,
+    }
+    risk_profile_overridden = "--risk-profile" in sys.argv
+    base_tokens_overridden = "--base-tokens" in sys.argv
+    model_price_overridden = "--model-price" in sys.argv
+    action_type_overridden = "--action-type" in sys.argv
+
     if args.text_input is not None:
         raw_claims = extract_claims_from_text(args.text_input)
-        claims = [ClaimReport.from_dict({"claim": claim}) for claim in raw_claims]
+        claims = [ClaimReport.from_dict({"claim": claim, **default_options}) for claim in raw_claims]
     elif args.input is not None:
         claims = load_claims_from_json(args.input)
+        for claim in claims:
+            if risk_profile_overridden:
+                claim.risk_profile = default_options["risk_profile"]
+            if base_tokens_overridden:
+                claim.base_tokens = default_options["base_tokens"]
+            if model_price_overridden:
+                claim.model_price = default_options["model_price"]
+            if action_type_overridden:
+                claim.action_type = default_options["action_type"]
     else:
         claims = get_sample_claims()
+        for claim in claims:
+            if risk_profile_overridden:
+                claim.risk_profile = default_options["risk_profile"]
+            if base_tokens_overridden:
+                claim.base_tokens = default_options["base_tokens"]
+            if model_price_overridden:
+                claim.model_price = default_options["model_price"]
+            if action_type_overridden:
+                claim.action_type = default_options["action_type"]
 
     if args.json:
         payload = [claim.to_dict() for claim in claims]
