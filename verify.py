@@ -1049,6 +1049,19 @@ def verify_claim(claim: str) -> None:
     report.print_report()
 
 
+def evaluate_text(text: str) -> list[dict[str, Any]]:
+    """Evaluate raw text by extracting candidate claims and returning JSON-ready reports."""
+    raw_claims = extract_claims_from_text(text)
+    claims = [ClaimReport.from_dict({"claim": claim}) for claim in raw_claims]
+    return [claim.to_dict() for claim in claims]
+
+
+def evaluate_claim(claim: str) -> dict[str, Any]:
+    """Evaluate one claim string and return a JSON-ready report dictionary."""
+    report = ClaimReport.from_dict({"claim": claim})
+    return report.to_dict()
+
+
 def validate_claim_entry(entry: Any, index: int) -> dict[str, Any]:
     """Validate one JSON claim entry and return it as a dictionary."""
     if not isinstance(entry, dict):
