@@ -37,6 +37,7 @@ ALLOWED_ACTION_STATUS = {
     "monitor_only",
     "do_not_act",
 }
+ALLOWED_RISK_PROFILES = {"strict", "balanced", "speculative"}
 
 FORWARD_LOOKING_TERMS = (" will ", " going to ", " expected ", " likely ")
 OPINION_TERMS = (" should ", " best ", " worst ", " better ")
@@ -94,6 +95,9 @@ class ClaimReport:
     analysis_claim: str = ""
     language_detected: str = "english"
     translation_used: bool = False
+    risk_profile: str = "balanced"
+    base_tokens: int = 500
+    model_price: float = 0.000002
     claim_type: str = "interpretive"
     truth_status: str = "unknown"
     evidence_strength: str = "none"
@@ -111,11 +115,15 @@ class ClaimReport:
     def from_dict(cls, data: dict[str, Any]) -> "ClaimReport":
         """Build a normalized + inferred ClaimReport from dictionary data."""
         claim = clean_text(data.get("claim"), fallback="No claim provided")
+        short_circuit = structural_short_circuit(claim)
         language_data = normalize_claim_language(claim)
         original_claim = language_data["original_claim"]
         analysis_claim = language_data["analysis_claim"]
         language_detected = language_data["language_detected"]
         translation_used = bool(language_data["translation_used"])
+        risk_profile = normalize_risk_profile(data.get("risk_profile"))
+        base_tokens = int(data.get("base_tokens", 500))
+        model_price = float(data.get("model_price", 0.000002))
         sources = clean_list(data.get("sources"))
         facts = clean_list(data.get("facts"))
         gaps = clean_list(data.get("gaps"))
@@ -153,12 +161,23 @@ class ClaimReport:
             else infer_action_status(truth_status, evidence_strength, bullshit_risk)
         )
 
+        if short_circuit is not None:
+            claim_type = short_circuit["claim_type"]
+            truth_status = short_circuit["truth_status"]
+            evidence_strength = short_circuit["evidence_strength"]
+            bullshit_risk = short_circuit["bullshit_risk"]
+            action_status = short_circuit["action_status"]
+            rewrite_required = short_circuit["rewrite_required"]
+
         return cls(
             claim=original_claim,
             original_claim=original_claim,
             analysis_claim=analysis_claim,
             language_detected=language_detected,
             translation_used=translation_used,
+            risk_profile=risk_profile,
+            base_tokens=base_tokens,
+            model_price=model_price,
             claim_type=claim_type,
             truth_status=truth_status,
             evidence_strength=evidence_strength,
@@ -176,6 +195,7 @@ class ClaimReport:
     def to_dict(self) -> dict[str, Any]:
         """Return structured agent-ready JSON output."""
         structural_validity = infer_structural_validity(self.analysis_claim)
+        risk_profile = normalize_risk_profile(self.risk_profile)
 
         truth_status = self.truth_status
         if truth_status == "unknown" and contradicts_known_constraints(self.analysis_claim):
@@ -249,6 +269,25 @@ class ClaimReport:
             enforcement_reason = "no evidentiary grounding"
             confidence = 0.6
 
+        if structural_validity == "invalid":
+            execution_permission = "block"
+        elif truth_status == "unsupported" and structural_validity == "valid":
+            if risk_profile == "strict":
+                execution_permission = "allow_with_warning"
+                enforcement_reason = "unsupported claim requires approval in strict profile"
+            else:
+                execution_permission = "allow_with_warning"
+
+        cost_estimate = compute_action_cost_estimate(
+            base_tokens=max(1, int(self.base_tokens)),
+            model_price=max(0.0, float(self.model_price)),
+            risk_profile=risk_profile,
+            decision_risk=decision_risk,
+            execution_permission=execution_permission,
+            expected_error_cost=expected_error_cost,
+            token_waste_risk=token_waste_risk,
+        )
+
         bypass_simulation = simulate_bypass(
             self,
             execution_permission=execution_permission,
@@ -269,6 +308,7 @@ class ClaimReport:
             "analysis_claim": self.analysis_claim,
             "language_detected": self.language_detected,
             "translation_used": self.translation_used,
+            "risk_profile": risk_profile,
             "claim_type": self.claim_type,
             "structural_validity": structural_validity,
             "truth_status": truth_status,
@@ -286,6 +326,7 @@ class ClaimReport:
             "failure_mode": failure_mode,
             "execution_permission": execution_permission,
             "enforcement_reason": enforcement_reason,
+            "cost_estimate": cost_estimate.to_dict(),
             "bypass_simulation": bypass_simulation,
             "reason": reason,
             "next_step": self.next_step or PLACEHOLDER_TEXT,
@@ -300,6 +341,7 @@ class ClaimReport:
         print_section("ANALYSIS CLAIM", text=self.analysis_claim)
         print_section("LANGUAGE DETECTED", text=self.language_detected)
         print_section("TRANSLATION USED", text=format_bool(self.translation_used))
+        print_section("RISK PROFILE", text=payload["risk_profile"])
         print_section("CLAIM TYPE", text=self.claim_type)
         print_section("STRUCTURAL VALIDITY", text=payload["structural_validity"])
         print_section("TRUTH STATUS", text=payload["truth_status"])
@@ -315,6 +357,20 @@ class ClaimReport:
         print_section("FAILURE MODE", text=payload["failure_mode"])
         print_section("EXECUTION PERMISSION", text=payload["execution_permission"])
         print_section("ENFORCEMENT REASON", text=payload["enforcement_reason"])
+        print_section(
+            "COST ESTIMATE",
+            items=[
+                f"base_tokens: {payload['cost_estimate']['base_tokens']}",
+                f"compute_multiplier: {payload['cost_estimate']['compute_multiplier']}",
+                f"correction_probability: {payload['cost_estimate']['correction_probability']}",
+                f"expected_tokens: {payload['cost_estimate']['expected_tokens']}",
+                f"expected_cost_usd: {payload['cost_estimate']['expected_cost_usd']}",
+                f"correction_cost_usd: {payload['cost_estimate']['correction_cost_usd']}",
+                f"total_expected_cost_usd: {payload['cost_estimate']['total_expected_cost_usd']}",
+                f"risk_label: {payload['cost_estimate']['risk_label']}",
+                f"proceed_recommendation: {payload['cost_estimate']['proceed_recommendation']}",
+            ],
+        )
         print_section(
             "BYPASS SIMULATION",
             items=[
@@ -345,6 +401,35 @@ class ClaimReport:
             print_section("NEXT STEP", text=self.next_step)
 
         print_divider()
+
+
+@dataclass
+class ActionCostEstimate:
+    """Economic estimate for claim execution under a risk profile."""
+
+    base_tokens: int
+    compute_multiplier: float
+    correction_probability: float
+    expected_tokens: int
+    expected_cost_usd: float
+    correction_cost_usd: float
+    total_expected_cost_usd: float
+    risk_label: str
+    proceed_recommendation: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert estimate to JSON-ready dictionary."""
+        return {
+            "base_tokens": self.base_tokens,
+            "compute_multiplier": round(self.compute_multiplier, 3),
+            "correction_probability": round(self.correction_probability, 3),
+            "expected_tokens": self.expected_tokens,
+            "expected_cost_usd": round(self.expected_cost_usd, 6),
+            "correction_cost_usd": round(self.correction_cost_usd, 6),
+            "total_expected_cost_usd": round(self.total_expected_cost_usd, 6),
+            "risk_label": self.risk_label,
+            "proceed_recommendation": self.proceed_recommendation,
+        }
 
 
 def has_user_value(value: Any) -> bool:
@@ -486,6 +571,18 @@ def normalize_action_status(value: Any) -> str:
     return normalized if normalized in ALLOWED_ACTION_STATUS else "monitor_only"
 
 
+def normalize_risk_profile(value: Any) -> str:
+    """Normalize risk profile into supported values."""
+    token = normalize_label(value)
+    alias_map = {
+        "conservative": "strict",
+        "default": "balanced",
+        "aggressive": "speculative",
+    }
+    normalized = alias_map.get(token, token)
+    return normalized if normalized in ALLOWED_RISK_PROFILES else "balanced"
+
+
 def normalize_rewrite_required(value: Any) -> bool:
     """Normalize rewrite_required into a boolean."""
     if isinstance(value, bool):
@@ -502,6 +599,67 @@ def normalize_rewrite_required(value: Any) -> bool:
             return False
 
     return False
+
+
+def structural_short_circuit(claim: str) -> dict[str, Any] | None:
+    """Short-circuit impossible structural claims before deeper inference."""
+    structural_validity = infer_structural_validity(claim)
+    if structural_validity != "invalid":
+        return None
+
+    return {
+        "claim_type": infer_claim_type(claim),
+        "truth_status": "structurally_invalid",
+        "evidence_strength": "none",
+        "bullshit_risk": "very_high",
+        "action_status": "do_not_act",
+        "rewrite_required": True,
+    }
+
+
+def compute_action_cost_estimate(
+    *,
+    base_tokens: int,
+    model_price: float,
+    risk_profile: str,
+    decision_risk: str,
+    execution_permission: str,
+    expected_error_cost: str,
+    token_waste_risk: str,
+) -> ActionCostEstimate:
+    """Estimate expected action cost and correction burden."""
+    risk_multiplier = {"strict": 1.05, "balanced": 1.2, "speculative": 1.4}.get(risk_profile, 1.2)
+    decision_multiplier = {"low": 1.0, "medium": 1.25, "high": 1.6}.get(decision_risk, 1.25)
+    waste_multiplier = {"low": 1.0, "medium": 1.2, "high": 1.5, "very_high": 2.0}.get(
+        token_waste_risk,
+        1.2,
+    )
+    compute_multiplier = round(risk_multiplier * decision_multiplier * waste_multiplier, 3)
+
+    correction_probability = {"low": 0.1, "medium": 0.35, "high": 0.7}.get(expected_error_cost, 0.35)
+    if execution_permission == "block":
+        correction_probability = max(correction_probability, 0.85)
+    elif execution_permission == "allow_with_warning":
+        correction_probability = max(correction_probability, 0.3)
+
+    expected_tokens = int(round(base_tokens * compute_multiplier))
+    expected_cost_usd = expected_tokens * model_price
+    correction_cost_usd = expected_cost_usd * correction_probability * 1.5
+    total_expected_cost_usd = expected_cost_usd + correction_cost_usd
+    proceed_recommendation = "proceed" if execution_permission != "block" else "do_not_proceed"
+    risk_label = expected_error_cost
+
+    return ActionCostEstimate(
+        base_tokens=base_tokens,
+        compute_multiplier=compute_multiplier,
+        correction_probability=correction_probability,
+        expected_tokens=expected_tokens,
+        expected_cost_usd=expected_cost_usd,
+        correction_cost_usd=correction_cost_usd,
+        total_expected_cost_usd=total_expected_cost_usd,
+        risk_label=risk_label,
+        proceed_recommendation=proceed_recommendation,
+    )
 
 
 def infer_claim_type(claim: str) -> str:
@@ -1186,6 +1344,25 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Raw text input to auto-extract claim candidates and evaluate them.",
     )
+    parser.add_argument(
+        "--base-tokens",
+        type=int,
+        default=500,
+        help="Base token budget used for cost estimation (default: 500).",
+    )
+    parser.add_argument(
+        "--model-price",
+        type=float,
+        default=0.000002,
+        help="USD price per token for cost estimation (default: 0.000002).",
+    )
+    parser.add_argument(
+        "--risk-profile",
+        type=str,
+        default="balanced",
+        choices=sorted(ALLOWED_RISK_PROFILES),
+        help="Risk profile for execution gating and cost posture.",
+    )
     return parser.parse_args()
 
 
@@ -1193,13 +1370,27 @@ def main() -> int:
     """Entry point for the CLI."""
     args = parse_args()
 
+    default_options = {
+        "risk_profile": normalize_risk_profile(args.risk_profile),
+        "base_tokens": args.base_tokens,
+        "model_price": args.model_price,
+    }
+
     if args.text_input is not None:
         raw_claims = extract_claims_from_text(args.text_input)
-        claims = [ClaimReport.from_dict({"claim": claim}) for claim in raw_claims]
+        claims = [ClaimReport.from_dict({"claim": claim, **default_options}) for claim in raw_claims]
     elif args.input is not None:
         claims = load_claims_from_json(args.input)
+        for claim in claims:
+            claim.risk_profile = default_options["risk_profile"]
+            claim.base_tokens = default_options["base_tokens"]
+            claim.model_price = default_options["model_price"]
     else:
         claims = get_sample_claims()
+        for claim in claims:
+            claim.risk_profile = default_options["risk_profile"]
+            claim.base_tokens = default_options["base_tokens"]
+            claim.model_price = default_options["model_price"]
 
     if args.json:
         payload = [claim.to_dict() for claim in claims]
